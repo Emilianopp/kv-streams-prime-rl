@@ -1,0 +1,588 @@
+import asyncio
+from collections import defaultdict
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from prime_rl.configs.orchestrator import CompactionPaddingConfig
+from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
+from prime_rl.utils.async_utils import safe_cancel
+
+
+def make_scheduler() -> Scheduler:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.max_async_level = 1
+    scheduler.strict_async_level = False
+    scheduler.step = 9
+    scheduler.ckpt_step = 7
+    scheduler.config = SimpleNamespace(
+        output_dir=Path("/tmp/prime-rl-test"),
+        compaction_padding=SimpleNamespace(
+            enabled=False,
+            phase4_enabled=False,
+            phase4_weight_sync_strategy="restart",
+        ),
+    )
+    scheduler.logger = MagicMock()
+    scheduler.checkpoint_ready = asyncio.Event()
+    scheduler.checkpoint_ready.set()
+    scheduler.lora_name = None
+    scheduler.model_name = "test-model"
+    scheduler.update_weights_time = 0
+    scheduler.wait_for_ckpt_time = 0
+    scheduler.inflight_requests = {}
+    scheduler.groups = {}
+    scheduler.rollouts_per_example = 4
+    scheduler.max_rollout_reschedules = 2
+    scheduler.max_off_policy_steps = 1
+    scheduler.cancelled_rollouts_count = 0
+    scheduler.dropped_error_groups_by_env = defaultdict(int)
+    scheduler.weight_sync_restarted_rollouts_count = 0
+    scheduler.policy_update_draining = False
+    scheduler.policy_update_pending_step = None
+    scheduler.policy_update_lock = asyncio.Lock()
+    scheduler.inflight_policy_update_task = None
+    scheduler.update_policy_task = None
+    scheduler.enable_policy_updates = True
+    scheduler._checked_initial_broadcast_state = False
+    scheduler.policy_update_draining = False
+    scheduler.policy_update_pending_step = None
+    return scheduler
+
+
+def test_failed_rollout_reschedules_are_bounded():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        group = GroupState(
+            example={"env_name": "test"},
+            rollouts_to_schedule=0,
+            completed_rollouts=[{"reward": 1.0}],
+        )
+        scheduler.groups = {1: group}
+        scheduler.drop_group = AsyncMock(return_value=3)
+
+        assert await scheduler._reschedule_failed_group(
+            group_id=1,
+            group=group,
+            env_name="test",
+            failed_rollouts=1,
+            requires_group_scoring=False,
+        )
+        assert group.rollouts_to_schedule == 1
+
+        assert await scheduler._reschedule_failed_group(
+            group_id=1,
+            group=group,
+            env_name="test",
+            failed_rollouts=1,
+            requires_group_scoring=False,
+        )
+        assert group.rollouts_to_schedule == 2
+
+        assert not await scheduler._reschedule_failed_group(
+            group_id=1,
+            group=group,
+            env_name="test",
+            failed_rollouts=1,
+            requires_group_scoring=False,
+        )
+        scheduler.drop_group.assert_awaited_once_with(1)
+        assert scheduler.cancelled_rollouts_count == 3
+        assert scheduler.dropped_error_groups_by_env["test"] == 1
+
+    asyncio.run(run())
+
+
+def test_group_scoring_failure_discards_partial_group_before_retry():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        group = GroupState(
+            example={"env_name": "test"},
+            rollouts_to_schedule=0,
+            completed_rollouts=[{"reward": 1.0}],
+        )
+
+        assert await scheduler._reschedule_failed_group(
+            group_id=1,
+            group=group,
+            env_name="test",
+            failed_rollouts=1,
+            requires_group_scoring=True,
+        )
+        assert group.completed_rollouts == []
+        assert group.rollouts_to_schedule == scheduler.rollouts_per_example
+
+    asyncio.run(run())
+
+
+def test_prompt_too_long_failure_is_not_rescheduled():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        group = GroupState(
+            example={"env_name": "test"},
+            rollouts_to_schedule=0,
+        )
+        scheduler.groups = {1: group}
+        scheduler.drop_group = AsyncMock(return_value=2)
+
+        rollout = {
+            "trajectory": [],
+            "error": None,
+            "stop_condition": "prompt_too_long",
+        }
+        assert scheduler._is_terminal_rollout_failure(rollout)
+        assert not scheduler._is_terminal_rollout_failure(
+            {
+                "trajectory": [{"completion": []}],
+                "error": {
+                    "error": "OverlongPromptError",
+                    "error_chain_repr": "OverlongPromptError()",
+                },
+                "stop_condition": "has_error",
+            }
+        )
+        assert not await scheduler._reschedule_failed_group(
+            group_id=1,
+            group=group,
+            env_name="test",
+            failed_rollouts=1,
+            requires_group_scoring=False,
+            terminal_failure=True,
+        )
+
+        assert group.reschedule_count == 0
+        scheduler.drop_group.assert_awaited_once_with(1)
+        assert scheduler.cancelled_rollouts_count == 2
+        assert scheduler.dropped_error_groups_by_env["test"] == 1
+
+    asyncio.run(run())
+
+
+def test_partial_cumulative_limit_failure_becomes_truncation():
+    rollout = {
+        "trajectory": [{"completion": [1, 2]}],
+        "error": {
+            "error": "OverlongPromptError",
+            "error_chain_repr": (
+                "OverlongPromptError: kv_eviction: cumulative logical sequence "
+                "reached its limit"
+            ),
+        },
+        "is_truncated": False,
+        "stop_condition": "has_error",
+    }
+
+    assert Scheduler._finish_cumulative_limit_rollout(rollout)
+    assert rollout["error"] is None
+    assert rollout["is_truncated"] is True
+    assert rollout["stop_condition"] == "max_sequence_length_reached"
+
+
+def test_unrelated_partial_failure_remains_an_error():
+    rollout = {
+        "trajectory": [{"completion": [1, 2]}],
+        "error": {
+            "error": "OverlongPromptError",
+            "error_chain_repr": "OverlongPromptError: prompt reached max_model_len",
+        },
+        "is_truncated": False,
+        "stop_condition": "has_error",
+    }
+
+    assert not Scheduler._finish_cumulative_limit_rollout(rollout)
+    assert rollout["error"] is not None
+
+
+def test_preserve_kv_is_valid_weight_sync_strategy():
+    config = CompactionPaddingConfig(
+        phase4_enabled=True,
+        phase4_weight_sync_strategy="preserve_kv",
+    )
+
+    assert config.phase4_weight_sync_strategy == "preserve_kv"
+
+
+def test_update_off_policy_does_not_increment_interleaved_on_policy_tasks():
+    async def run() -> None:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_off_policy_steps = 1
+        scheduler.cancelled_rollouts_count = 0
+        scheduler.logger = MagicMock()
+
+        client = SimpleNamespace(api_base_url="http://test")
+        stale_task = asyncio.create_task(asyncio.sleep(60))
+        survivor_task = asyncio.create_task(asyncio.sleep(60))
+        interleaved_task = None
+
+        scheduler.inflight_requests = {
+            stale_task: InflightRequest(
+                off_policy_steps=1,
+                client_config=client,
+                env_name="test",
+                group_id=1,
+            ),
+            survivor_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=2,
+            ),
+        }
+
+        async def drop_group(group_id: int) -> int:
+            tasks_to_remove = [
+                task for task, info in list(scheduler.inflight_requests.items()) if info.group_id == group_id
+            ]
+            for task in tasks_to_remove:
+                scheduler.inflight_requests.pop(task, None)
+                task.cancel()
+
+            await asyncio.sleep(0)
+
+            nonlocal interleaved_task
+            if interleaved_task is None:
+                interleaved_task = asyncio.create_task(asyncio.sleep(60))
+                scheduler.inflight_requests[interleaved_task] = InflightRequest(
+                    off_policy_steps=0,
+                    client_config=client,
+                    env_name="test",
+                    group_id=3,
+                )
+            return len(tasks_to_remove)
+
+        scheduler.drop_group = drop_group
+
+        await scheduler._update_off_policy()
+
+        assert stale_task not in scheduler.inflight_requests
+        assert scheduler.inflight_requests[survivor_task].off_policy_steps == 1
+        assert interleaved_task is not None
+        assert scheduler.inflight_requests[interleaved_task].off_policy_steps == 0
+        assert scheduler.cancelled_rollouts_count == 1
+
+        for task in (stale_task, survivor_task, interleaved_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_restart_inflight_rollouts_for_weight_sync_requeues_active_phase4_tasks():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.compaction_padding.enabled = True
+        scheduler.config.compaction_padding.phase4_enabled = True
+        scheduler.weight_sync_restarted_rollouts_count = 0
+
+        client = SimpleNamespace(api_base_url="http://test", extra_headers={})
+        active_task = asyncio.create_task(asyncio.sleep(60))
+        done_task = asyncio.create_task(asyncio.sleep(0))
+        await done_task
+
+        scheduler.groups = {
+            1: GroupState(
+                example={"env_name": "test"},
+                rollouts_to_schedule=0,
+                completed_rollouts=[{"reward": 1.0}],
+            ),
+            2: GroupState(example={"env_name": "test"}, rollouts_to_schedule=0),
+        }
+        scheduler.inflight_requests = {
+            active_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=1,
+                rollout_count=2,
+            ),
+            done_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=2,
+                rollout_count=1,
+            ),
+        }
+
+        restarted = await scheduler.restart_inflight_rollouts_for_weight_sync(8)
+
+        assert restarted == 2
+        assert active_task not in scheduler.inflight_requests
+        assert done_task in scheduler.inflight_requests
+        assert scheduler.groups[1].rollouts_to_schedule == 2
+        assert scheduler.groups[1].completed_rollouts == [{"reward": 1.0}]
+        assert scheduler.cancelled_rollouts_count == 2
+        assert scheduler.weight_sync_restarted_rollouts_count == 2
+        assert active_task.cancelled()
+
+    asyncio.run(run())
+
+
+def test_drain_weight_sync_defers_policy_update_until_inflight_rollouts_finish():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.compaction_padding.enabled = True
+        scheduler.config.compaction_padding.phase4_enabled = True
+        scheduler.config.compaction_padding.phase4_weight_sync_strategy = "drain"
+
+        client = SimpleNamespace(api_base_url="http://test", extra_headers={})
+        active_task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests = {
+            active_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=1,
+                rollout_count=2,
+            ),
+        }
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=AsyncMock(),
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
+
+        assert scheduler.policy_update_draining is True
+        assert scheduler.policy_update_pending_step == 8
+        assert scheduler.checkpoint_ready.is_set()
+        scheduler.inference_pool.update_weights.assert_not_called()
+        assert active_task in scheduler.inflight_requests
+        active_task.cancel()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_preserve_kv_updates_without_cancelling_inflight_rollouts():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.compaction_padding.enabled = True
+        scheduler.config.compaction_padding.phase4_enabled = True
+        scheduler.config.compaction_padding.phase4_weight_sync_strategy = "preserve_kv"
+
+        active_task = asyncio.create_task(asyncio.sleep(60))
+        client = SimpleNamespace(api_base_url="http://test", extra_headers={})
+        scheduler.inflight_requests = {
+            active_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=1,
+                rollout_count=2,
+            )
+        }
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=AsyncMock(),
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
+
+        assert active_task in scheduler.inflight_requests
+        assert not active_task.cancelled()
+        scheduler.inference_pool.update_weights.assert_awaited_once()
+        assert scheduler.inference_pool.update_weights.await_args.kwargs["preserve_kv"] is True
+        assert scheduler.ckpt_step == 8
+        active_task.cancel()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_schedule_rollout_rechecks_weight_sync_gate_after_rate_limit_wait():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.rate_limiter = SimpleNamespace()
+
+        async def acquire() -> None:
+            scheduler.checkpoint_ready.clear()
+
+        scheduler.rate_limiter.acquire = acquire
+        scheduler.groups = {
+            1: GroupState(
+                example={"env_name": "test"},
+                rollouts_to_schedule=1,
+            )
+        }
+
+        launched = await scheduler.schedule_rollout(group_id=1)
+
+        assert launched is False
+        assert scheduler.groups[1].rollouts_to_schedule == 1
+        assert scheduler.inflight_requests == {}
+
+    asyncio.run(run())
+
+
+def test_drain_weight_sync_updates_once_inflight_rollouts_are_empty():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.compaction_padding.enabled = True
+        scheduler.config.compaction_padding.phase4_enabled = True
+        scheduler.config.compaction_padding.phase4_weight_sync_strategy = "drain"
+        scheduler.policy_update_draining = True
+        scheduler.policy_update_pending_step = 8
+        applied_steps: list[int] = []
+
+        async def update_weights(weight_dir, lora_name=None, step=0, preserve_kv=False) -> None:
+            applied_steps.append(step)
+
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=update_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
+
+        assert applied_steps == [8]
+        assert scheduler.ckpt_step == 8
+        assert scheduler.policy_update_draining is False
+        assert scheduler.policy_update_pending_step is None
+
+    asyncio.run(run())
+
+
+def test_maybe_update_policy_reuses_inflight_update_after_cancellation():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        applied_steps: list[int] = []
+
+        async def update_weights(weight_dir, lora_name=None, step=0, preserve_kv=False) -> None:
+            applied_steps.append(step)
+            started.set()
+            await release.wait()
+
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=update_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            first = asyncio.create_task(scheduler.maybe_update_policy())
+            await started.wait()
+            await safe_cancel(first)
+
+            second = asyncio.create_task(scheduler.maybe_update_policy())
+            await asyncio.sleep(0)
+            assert applied_steps == [8]
+
+            release.set()
+            await second
+
+        assert applied_steps == [8]
+        assert scheduler.ckpt_step == 8
+
+    asyncio.run(run())
+
+
+def test_maybe_update_policy_refuses_stale_broadcast_when_starting_from_checkpoint():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.step = 50
+        scheduler.ckpt_step = 50
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=AsyncMock(),
+            update_model_name=MagicMock(),
+        )
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=51),
+            pytest.raises(RuntimeError, match="stale broadcast weights"),
+        ):
+            await scheduler.maybe_update_policy()
+
+        scheduler.inference_pool.update_weights.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_pause_policy_updates_cancels_loop_and_waits_for_active_sync():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        loop_cancelled = asyncio.Event()
+        sync_started = asyncio.Event()
+        sync_finished = asyncio.Event()
+
+        async def update_loop() -> None:
+            try:
+                await asyncio.Future()
+            finally:
+                loop_cancelled.set()
+
+        async def active_sync() -> None:
+            sync_started.set()
+            await asyncio.sleep(0.01)
+            sync_finished.set()
+
+        scheduler.update_policy_task = asyncio.create_task(update_loop())
+        scheduler.inflight_policy_update_task = asyncio.create_task(active_sync())
+
+        await sync_started.wait()
+        await scheduler.pause_policy_updates()
+
+        assert loop_cancelled.is_set()
+        assert scheduler.update_policy_task is None
+        assert sync_finished.is_set()
+        assert scheduler.inflight_policy_update_task.done()
+        assert not scheduler.inflight_policy_update_task.cancelled()
+
+    asyncio.run(run())
+
+
+def test_stop_cancels_inflight_policy_update_task():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def update_weights(weight_dir, lora_name=None, step=0, preserve_kv=False) -> None:
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=update_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            scheduler.update_policy_task = asyncio.create_task(scheduler.maybe_update_policy())
+            await started.wait()
+            await asyncio.wait_for(scheduler.stop(), timeout=0.2)
+
+        assert cancelled.is_set()
+        assert scheduler.update_policy_task is None
+        assert scheduler.inflight_policy_update_task is None
+
+    asyncio.run(run())
